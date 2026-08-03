@@ -1,0 +1,4 @@
+{"timestamp": "2026-07-30T14:16:04Z", "level": "error", "service": "checkout", "message": "connection pool exhausted: timeout waiting for available connection"}
+{"timestamp": "2026-07-30T14:15:49Z", "level": "error", "service": "checkout", "message": "connection pool exhausted: timeout waiting for available connection"}
+{"timestamp": "2026-07-30T14:15:34Z", "level": "info", "service": "checkout", "message": "deploy completed: pool_size reduced from 50 to 10"}
+{"timestamp": "2026-07-30T13:56:34Z", "level": "info", "service": "checkout", "message": "order created successfully"}
