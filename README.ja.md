@@ -12,6 +12,7 @@ LLMを活用したインシデント調査エージェント。アラートが�
 ```
 incident-agent/
 ├── internal/claude    最小限のAnthropic Messages APIクライアント(SDK不使用)
+├── internal/ollama    ローカルOllama chat APIクライアント(無料・APIキー不要)
 ├── internal/alert     正規化されたアラート形式(ソースに依存しない)
 ├── internal/sources   差し替え可能なログ / デプロイ / メトリクスプロバイダ
 ├── internal/agent     オーケストレーション: コンテキスト収集 → プロンプト → レポート解析
@@ -38,6 +39,38 @@ export ANTHROPIC_API_KEY=sk-ant-...
   -github-owner myorg -github-repo myrepo \
   -slack-webhook https://hooks.slack.com/services/...
 ```
+
+### Ollamaで無料実行する(APIキー不要・課金なし)
+
+Anthropic APIは従量課金制であり、これ自体を本プロジェクト側で無料にすること
+はできない(Anthropicの有料サービスであるため)。ただし `-provider ollama`
+を指定すると、推論部分を[Ollama](https://ollama.com)で動かすローカルモデル
+に切り替えられ、ツール全体を無料で実行できる。
+
+```bash
+brew install ollama        # または https://ollama.com/download を参照
+ollama serve &              # :11434 でローカルサーバーが起動する
+ollama pull llama3.1        # 好きなローカルモデルでよい(大きいほど精度は上がる)
+
+go build -o investigator ./cmd/investigator
+./investigator investigate -provider ollama -model llama3.1 \
+  -service checkout -title "High 5xx error rate" \
+  -message "Error rate exceeded 5% for 3 minutes" -severity critical \
+  -logs ./testdata/sample.log \
+  -github-owner myorg -github-repo myrepo
+```
+
+このモードでは `ANTHROPIC_API_KEY` は不要。`ANTHROPIC_API_KEY` が未設定の
+場合、`-provider` は自動的に `ollama` にフォールバックする。`-model` でロー
+カルにpull済みのモデルを指定でき(デフォルトは `llama3.1`)、サーバーアドレ
+スがデフォルトの `http://localhost:11434` と異なる場合は `OLLAMA_HOST` で
+上書きできる。レポートの品質はローカルモデルの推論能力に依存し、この種の構
+造化分析タスクでは一般にClaudeより弱くなる(特に小さいモデルサイズでは顕
+著)。
+
+このプロジェクトの他の部分 — GitHubのデプロイ相関、Slack Webhook通知、ファ
+イルベースのログソース — は元々課金されるAPI呼び出しを行っていない。課金対
+象だったのはLLM呼び出しのみである。
 
 Webhookを発火できるアラートシステム(Datadog、Alertmanager、SNS→Lambda経由の
 CloudWatch Alarms、PagerDutyなど)であれば、`internal/alert.Alert` に一致する

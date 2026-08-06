@@ -13,6 +13,7 @@ dependency-free, open-source tool.
 ```
 incident-agent/
 ├── internal/claude    minimal Anthropic Messages API client (no SDK)
+├── internal/ollama    minimal local Ollama chat API client (free, no API key)
 ├── internal/alert     normalized alert shape (source-agnostic)
 ├── internal/sources   pluggable log / deploy / metric providers
 ├── internal/agent     orchestration: gather context → prompt → parse report
@@ -39,6 +40,38 @@ export ANTHROPIC_API_KEY=sk-ant-...
   -github-owner myorg -github-repo myrepo \
   -slack-webhook https://hooks.slack.com/services/...
 ```
+
+### Running for free with Ollama (no API key, no billing)
+
+The Anthropic API is metered and can't be made free by this project - it's
+Anthropic's paid service. But `-provider ollama` swaps the reasoning step to
+a model running locally via [Ollama](https://ollama.com), so the whole tool
+runs at zero cost:
+
+```bash
+brew install ollama        # or see https://ollama.com/download
+ollama serve &              # starts the local server on :11434
+ollama pull llama3.1        # any local model works; bigger = better reports
+
+go build -o investigator ./cmd/investigator
+./investigator investigate -provider ollama -model llama3.1 \
+  -service checkout -title "High 5xx error rate" \
+  -message "Error rate exceeded 5% for 3 minutes" -severity critical \
+  -logs ./testdata/sample.log \
+  -github-owner myorg -github-repo myrepo
+```
+
+No `ANTHROPIC_API_KEY` needed for this mode - `-provider` even defaults to
+`ollama` automatically if that variable is unset. `-model` picks which
+locally-pulled model to use (default `llama3.1`); `OLLAMA_HOST` overrides the
+server address if it isn't the default `http://localhost:11434`. Report
+quality depends on the local model's reasoning ability, which is generally
+weaker than Claude on this kind of structured analysis task, especially at
+smaller model sizes.
+
+Everything else in this project - the GitHub deploy correlation, the Slack
+webhook notifier, and the file-based log source - already makes no paid API
+calls; the LLM call was the only metered dependency.
 
 Any alerting system that can fire a webhook (Datadog, Alertmanager,
 CloudWatch Alarms via SNS→Lambda, PagerDuty) can be pointed at `POST

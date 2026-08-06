@@ -29,23 +29,54 @@ import (
 	"incident-agent/internal/alert"
 	"incident-agent/internal/claude"
 	"incident-agent/internal/notify"
+	"incident-agent/internal/ollama"
 	"incident-agent/internal/sources"
 )
 
-func buildInvestigator(model, logPath, githubOwner, githubRepo, githubToken string) (*agent.Investigator, error) {
+// buildLLMClient picks which model backend to reason with. "claude" calls
+// the (paid) Anthropic API; "ollama" calls a local Ollama server running a
+// locally pulled model, which is free and needs no API key. provider == ""
+// auto-selects: Claude if ANTHROPIC_API_KEY is set, otherwise Ollama, so the
+// tool runs for free out of the box once a model has been `ollama pull`ed.
+func buildLLMClient(provider, model string) (agent.ClaudeClient, error) {
 	apiKey := os.Getenv("ANTHROPIC_API_KEY")
-	if apiKey == "" {
-		return nil, fmt.Errorf("ANTHROPIC_API_KEY environment variable is not set")
-	}
-	if model == "" {
-		model = "claude-sonnet-4-6"
+	if provider == "" {
+		if apiKey != "" {
+			provider = "claude"
+		} else {
+			provider = "ollama"
+		}
 	}
 
-	claudeClient := claude.NewClient(apiKey, model)
-	if base := os.Getenv("ANTHROPIC_BASE_URL"); base != "" {
-		claudeClient.BaseURL = base
+	switch provider {
+	case "claude":
+		if apiKey == "" {
+			return nil, fmt.Errorf("ANTHROPIC_API_KEY environment variable is not set (or pass -provider ollama to run for free against a local model)")
+		}
+		if model == "" {
+			model = "claude-sonnet-4-6"
+		}
+		c := claude.NewClient(apiKey, model)
+		if base := os.Getenv("ANTHROPIC_BASE_URL"); base != "" {
+			c.BaseURL = base
+		}
+		return c, nil
+	case "ollama":
+		if model == "" {
+			model = "llama3.1"
+		}
+		return ollama.NewClient(os.Getenv("OLLAMA_HOST"), model), nil
+	default:
+		return nil, fmt.Errorf("unknown -provider %q (want claude|ollama)", provider)
 	}
-	inv := agent.NewInvestigator(claudeClient)
+}
+
+func buildInvestigator(provider, model, logPath, githubOwner, githubRepo, githubToken string) (*agent.Investigator, error) {
+	llmClient, err := buildLLMClient(provider, model)
+	if err != nil {
+		return nil, err
+	}
+	inv := agent.NewInvestigator(llmClient)
 
 	if logPath != "" {
 		inv.Logs = sources.NewFileLogSource(logPath)
@@ -67,15 +98,17 @@ func runInvestigate(args []string) error {
 	githubRepo := fs.String("github-repo", "", "GitHub repo name, for correlating recent commits")
 	githubToken := fs.String("github-token", os.Getenv("GITHUB_TOKEN"), "optional GitHub token (raises API rate limit)")
 	slackWebhook := fs.String("slack-webhook", "", "optional Slack incoming webhook URL to also post the report to")
-	model := fs.String("model", "", "Claude model to use (default claude-sonnet-4-6)")
+	provider := fs.String("provider", "", "LLM backend: claude|ollama (default: claude if ANTHROPIC_API_KEY is set, else ollama)")
+	model := fs.String("model", "", "model to use (default claude-sonnet-4-6, or llama3.1 for -provider ollama)")
 	lookback := fs.Duration("lookback", 30*time.Minute, "how far back to search logs/deploys")
+	timeout := fs.Duration("timeout", 2*time.Minute, "overall investigation timeout (raise this for -provider ollama on modest hardware, where local CPU inference can be much slower than the Claude API)")
 	fs.Parse(args)
 
 	if *service == "" || *title == "" {
 		return fmt.Errorf("-service and -title are required")
 	}
 
-	inv, err := buildInvestigator(*model, *logPath, *githubOwner, *githubRepo, *githubToken)
+	inv, err := buildInvestigator(*provider, *model, *logPath, *githubOwner, *githubRepo, *githubToken)
 	if err != nil {
 		return err
 	}
@@ -92,7 +125,7 @@ func runInvestigate(args []string) error {
 		ReceivedAt: time.Now(),
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
 	defer cancel()
 
 	report, err := inv.Investigate(ctx, a)
@@ -122,10 +155,12 @@ func runServe(args []string) error {
 	githubRepo := fs.String("github-repo", "", "GitHub repo name, for correlating recent commits")
 	githubToken := fs.String("github-token", os.Getenv("GITHUB_TOKEN"), "optional GitHub token")
 	slackWebhook := fs.String("slack-webhook", "", "Slack incoming webhook URL to post reports to")
-	model := fs.String("model", "", "Claude model to use (default claude-sonnet-4-6)")
+	provider := fs.String("provider", "", "LLM backend: claude|ollama (default: claude if ANTHROPIC_API_KEY is set, else ollama)")
+	model := fs.String("model", "", "model to use (default claude-sonnet-4-6, or llama3.1 for -provider ollama)")
+	timeout := fs.Duration("timeout", 2*time.Minute, "per-alert investigation timeout (raise this for -provider ollama on modest hardware, where local CPU inference can be much slower than the Claude API)")
 	fs.Parse(args)
 
-	inv, err := buildInvestigator(*model, *logPath, *githubOwner, *githubRepo, *githubToken)
+	inv, err := buildInvestigator(*provider, *model, *logPath, *githubOwner, *githubRepo, *githubToken)
 	if err != nil {
 		return err
 	}
@@ -155,7 +190,7 @@ func runServe(args []string) error {
 		// shouldn't be on that critical path or risk the webhook timing out
 		// and retrying (which would trigger a duplicate investigation).
 		go func(a alert.Alert) {
-			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+			ctx, cancel := context.WithTimeout(context.Background(), *timeout)
 			defer cancel()
 			report, err := inv.Investigate(ctx, a)
 			if err != nil {
