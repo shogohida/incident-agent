@@ -1,0 +1,7 @@
+services:
+  - type: web
+    name: incident-agent-demo
+    runtime: go
+    plan: free
+    buildCommand: go build -o bin/server ./cmd/server
+    startCommand: ./bin/server
