@@ -8,7 +8,10 @@ import (
 	"incident-agent/internal/sources"
 )
 
-const systemPrompt = `You are an experienced Site Reliability Engineer performing a first-pass
+// SystemPrompt is exported so callers that reason over already-gathered
+// context outside of Investigate (e.g. cmd/server's browser-demo proxy)
+// can reuse the exact same prompt instead of duplicating it.
+const SystemPrompt = `You are an experienced Site Reliability Engineer performing a first-pass
 investigation of a production incident. You will be given the alert that
 fired, plus whatever recent logs, deploy history, and metrics were
 available to gather automatically.

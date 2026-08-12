@@ -74,7 +74,7 @@ type Report struct {
 }
 
 // modelResponse mirrors the JSON shape we instruct the model to produce
-// (see systemPrompt in prompt.go).
+// (see SystemPrompt in prompt.go).
 type modelResponse struct {
 	Summary             string       `json:"summary"`
 	AssessedSeverity    string       `json:"assessed_severity"`
@@ -88,10 +88,18 @@ type modelResponse struct {
 // failures) and asks Claude to produce a structured root-cause report.
 func (inv *Investigator) Investigate(ctx context.Context, a alert.Alert) (*Report, error) {
 	logs, deploys, metrics, sourceErrors := inv.gatherContext(ctx, a)
+	return inv.InvestigateContext(ctx, a, logs, deploys, metrics, sourceErrors)
+}
 
+// InvestigateContext reasons over context that's already been gathered,
+// skipping the concurrent source-fetching Investigate does. This is what a
+// caller who already has the logs/deploys/metrics in hand uses directly -
+// e.g. cmd/server's browser-demo proxy, where the browser already gathered
+// (or the visitor pasted) the data and there's nothing left to fetch.
+func (inv *Investigator) InvestigateContext(ctx context.Context, a alert.Alert, logs []sources.LogEntry, deploys []sources.Deploy, metrics []sources.MetricSeries, sourceErrors []string) (*Report, error) {
 	userMessage := buildUserMessage(a, logs, deploys, metrics, sourceErrors)
 
-	rawText, err := inv.Claude.Complete(ctx, systemPrompt, userMessage, inv.maxTokensOrDefault())
+	rawText, err := inv.Claude.Complete(ctx, SystemPrompt, userMessage, inv.maxTokensOrDefault())
 	if err != nil {
 		return nil, fmt.Errorf("agent: claude request failed: %w", err)
 	}
