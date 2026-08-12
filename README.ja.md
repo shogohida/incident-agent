@@ -1,5 +1,8 @@
 # incident-agent
 
+[![CI](https://github.com/shogohida/incident-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/shogohida/incident-agent/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 LLMを活用したインシデント調査エージェント。アラートが発火すると、直近のログ・
 デプロイ履歴・メトリクスを収集し、それらをClaudeに渡して、オンコール担当者向け
 の構造化された根本原因レポートを — 人間がダッシュボードを開くよりも早く、数秒
@@ -153,3 +156,14 @@ GitHubがレート制限をかけたりしても、調査は続行される — 
   ジトリには含めていない。
 - **調査間の会話メモリがない** — 各アラートは独立して調査される。「今週3件目
   のcheckoutインシデントである」といった相関づけは未実装。
+
+## コントリビュート
+
+バグ報告・PRを歓迎します。セットアップ方法やマージ前のCIチェックについては
+[CONTRIBUTING.md](CONTRIBUTING.md)（英語）を参照してください。セキュリティ
+上の問題は公開issueではなく[SECURITY.md](SECURITY.md)（英語）の手順に従って
+ご連絡ください。
+
+## ライセンス
+
+[MIT](LICENSE)

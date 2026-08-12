@@ -1,5 +1,8 @@
 # incident-agent
 
+[![CI](https://github.com/shogohida/incident-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/shogohida/incident-agent/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 An LLM-powered incident investigation agent: when an alert fires, it
 gathers recent logs, deploy history, and metrics, hands them to Claude, and
 produces a structured root-cause report for the on-call engineer — in
@@ -156,3 +159,13 @@ end than a dependency whose retry/auth/parsing behavior lives elsewhere.
 - **No conversation memory across investigations** — each alert is
   investigated independently; correlating "this is the third checkout
   incident this week" is not yet implemented.
+
+## Contributing
+
+Bug reports and PRs are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md) for
+how to get set up and what CI checks before merge. For security issues,
+please see [SECURITY.md](SECURITY.md) instead of opening a public issue.
+
+## License
+
+[MIT](LICENSE)

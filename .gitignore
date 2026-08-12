@@ -1,0 +1,23 @@
+# Build artifacts
+/investigator
+/server
+/bin/
+
+# Anything explicitly built to a binary-looking name at the repo root
+/*.exe
+/*.dll
+/*.so
+/*.dylib
+
+# Local run output / scratch files
+report.txt
+*.log
+
+# Env files (never commit real secrets)
+.env
+.env.*
+
+# OS / editor cruft
+.DS_Store
+.idea/
+.vscode/
