@@ -10,6 +10,11 @@ This generalizes a system I built and ran in production at Zeroboard Inc.
 time to diagnosis by ~50%), rewritten from scratch as a standalone,
 dependency-free, open-source tool.
 
+**[Live demo](https://incident-agent-demo.onrender.com/)** — fire a canned
+incident and watch the investigation happen in your browser, either against
+a small free in-browser model or the real Claude API with your own key.
+(日本語版は<https://incident-agent-demo.onrender.com/ja>)
+
 ```
 incident-agent/
 ├── internal/claude    minimal Anthropic Messages API client (no SDK)

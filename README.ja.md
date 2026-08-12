@@ -9,6 +9,12 @@ LLMを活用したインシデント調査エージェント。アラートが�
 調査・アラート分析で、診断までの平均時間を約50%削減)を一般化したもので、
 外部依存のないスタンドアロンのOSSツールとしてゼロから書き直したものである。
 
+**[ライブデモ](https://incident-agent-demo.onrender.com/ja)** — 用意された
+インシデントを発火させ、ブラウザ内で調査が進む様子を見ることができる
+（無料のブラウザ内小型モデル、または自分のAPIキーで本物のClaude APIのどちらか
+を選択可能）。
+(English: <https://incident-agent-demo.onrender.com/>)
+
 ```
 incident-agent/
 ├── internal/claude    最小限のAnthropic Messages APIクライアント(SDK不使用)
