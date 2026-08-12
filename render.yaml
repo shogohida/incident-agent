@@ -5,3 +5,14 @@ services:
     plan: free
     buildCommand: go build -o bin/server ./cmd/server
     startCommand: ./bin/server
+    envVars:
+      # Set in the Render dashboard, not here - enables the rate-limited
+      # "Claude API (free tier)" backend in the demo. Leave unset to run
+      # the demo with only bring-your-own-key and in-browser AI.
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      # Optional overrides for the free-tier rate limits (defaults: 5 and 200).
+      - key: FREE_TIER_MAX_PER_IP_PER_HOUR
+        value: "5"
+      - key: FREE_TIER_MAX_PER_DAY
+        value: "200"
