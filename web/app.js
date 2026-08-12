@@ -1,17 +1,22 @@
 // incident-agent browser demo. No build step, no framework — plain ES
 // modules, same spirit as the sibling sqllab/schemalab/routelab demo pages.
 //
-// There is no backend here: the three incident scenarios below are static
-// fixtures shaped exactly like the real tool's internal/alert.Alert and
-// internal/sources types (same JSON field names), and the system prompt +
-// user-message formatting in this file are a line-for-line port of
-// internal/agent/prompt.go. The reasoning step is pluggable between two
-// backends the user picks in the UI: a small model loaded via WebLLM/WebGPU
-// and run entirely in the browser (free, no key, but a small model makes
-// more mistakes and can run out of GPU memory on constrained devices), or
-// the real Claude API called directly from the browser with a
-// user-supplied key (same backend production uses — see runClaudeApi below
-// for exactly what is sent where).
+// The three incident scenarios below are static fixtures shaped exactly
+// like the real tool's internal/alert.Alert and internal/sources types
+// (same JSON field names), and the system prompt + user-message formatting
+// in this file are a line-for-line port of internal/agent/prompt.go. The
+// reasoning step is pluggable between three backends the user picks in the
+// UI:
+//   - 'free'   - this same server's POST /api/investigate, which runs the
+//                real internal/agent pipeline against a key the operator
+//                pays for, rate-limited server-side (cmd/server) so no
+//                visitor needs their own key. Default.
+//   - 'claude' - the real Claude API called directly from the browser with
+//                a visitor-supplied key (see runClaudeApi).
+//   - 'webllm' - a small model loaded via WebLLM/WebGPU and run entirely in
+//                the browser - free and needs no server, but a small model
+//                makes more mistakes and can run out of GPU memory on
+//                constrained devices (see runWebLLM).
 
 // --- scenario fixtures -----------------------------------------------
 
@@ -264,10 +269,12 @@ const investigateBtn = document.getElementById('investigateBtn');
 const aiStatus = document.getElementById('aiStatus');
 const reportBox = document.getElementById('reportBox');
 const logEl = document.getElementById('log');
-const backendWebllmBtn = document.getElementById('backendWebllmBtn');
+const backendFreeBtn = document.getElementById('backendFreeBtn');
 const backendClaudeBtn = document.getElementById('backendClaudeBtn');
-const webllmPanel = document.getElementById('webllmPanel');
+const backendWebllmBtn = document.getElementById('backendWebllmBtn');
+const freePanel = document.getElementById('freePanel');
 const claudePanel = document.getElementById('claudePanel');
+const webllmPanel = document.getElementById('webllmPanel');
 const claudeApiKeyInput = document.getElementById('claudeApiKey');
 const saveKeyBtn = document.getElementById('saveKeyBtn');
 
@@ -306,15 +313,81 @@ function buildCustomTemplate(now) {
   return JSON.stringify(example, null, 2);
 }
 
-function parseDate(v, fieldName) {
+// Returns a Date for a given value, or null if v is missing/unparseable —
+// callers fall back to a default rather than rejecting the whole payload
+// over one bad or absent timestamp.
+function parseDateLenient(v) {
+  if (v === undefined || v === null || v === '') return null;
   const d = new Date(v);
-  if (isNaN(d.getTime())) throw new Error(`${fieldName} is not a valid date/time: ${JSON.stringify(v)}`);
-  return d;
+  return isNaN(d.getTime()) ? null : d;
+}
+
+function asObject(v) {
+  return v && typeof v === 'object' && !Array.isArray(v) ? v : {};
+}
+
+function firstDefined(obj, keys) {
+  for (const k of keys) {
+    if (obj[k] !== undefined && obj[k] !== null && obj[k] !== '') return obj[k];
+  }
+  return undefined;
+}
+
+// Best-effort epoch guess: 13-digit numbers are epoch milliseconds, but
+// most structured loggers (and the sample payload this was written
+// against) emit 10-digit epoch *seconds* - naively feeding those into
+// `new Date()` lands in 1970. Anything under 1e12 is assumed to be seconds.
+function parseTimestampGuess(v) {
+  if (v === undefined || v === null || v === '') return null;
+  if (typeof v === 'number') {
+    const d = new Date(v < 1e12 ? v * 1000 : v);
+    return isNaN(d.getTime()) ? null : d;
+  }
+  return parseDateLenient(v);
+}
+
+const LOG_LEVEL_TO_SEVERITY = {
+  error: 'critical', fatal: 'critical', critical: 'critical', panic: 'critical',
+  warn: 'warning', warning: 'warning',
+  info: 'info', debug: 'info', trace: 'info',
+};
+const KNOWN_TOP_LEVEL_KEYS = ['alert', 'logs', 'deploys', 'metrics', 'sourceErrors'];
+const MAX_WRAPPED_MESSAGE_CHARS = 4000;
+
+// Most structured loggers (Datadog forwarders, CloudWatch, etc.) emit one
+// flat JSON object per log line - not wrapped in {alert, logs, ...}. If the
+// pasted JSON has none of our known top-level keys, treat it as exactly
+// that: one raw log line. Guess a timestamp/level/service/message from the
+// field names loggers commonly use, and carry the entire object into the
+// log message (JSON.stringify) so nothing not recognized is silently
+// dropped - the LLM still sees it as evidence even if we can't label it.
+function wrapAsSingleLogEntry(data) {
+  const level = String(firstDefined(data, ['level', 'severity', 'log_level', 'logLevel']) || 'info').toLowerCase();
+  const service = firstDefined(data, ['service', 'service_name', 'serviceName', 'app', 'application', 'host', 'component']);
+  const messageField = firstDefined(data, ['message', 'msg', 'error_message', 'errorMessage', 'description', 'text']);
+  const timestamp = (parseTimestampGuess(firstDefined(data, ['timestamp', 'ts', 'time', 'date', 'datetime'])) || new Date()).toISOString();
+
+  let raw = JSON.stringify(data);
+  if (raw.length > MAX_WRAPPED_MESSAGE_CHARS) raw = raw.slice(0, MAX_WRAPPED_MESSAGE_CHARS) + '…(truncated)';
+  const message = messageField ? `${messageField} — ${raw}` : raw;
+
+  return {
+    alert: {
+      service, title: messageField ? String(messageField).slice(0, 140) : undefined,
+      message, severity: LOG_LEVEL_TO_SEVERITY[level] || 'warning', fired_at: timestamp,
+    },
+    logs: [{ timestamp, level, service, message }],
+    deploys: [], metrics: [], sourceErrors: [],
+  };
 }
 
 // Parses the pasted JSON into the same shape buildScenarios() produces, so
 // the rest of the app (renderContext, buildUserMessage, ...) needs no
-// custom-vs-fixture branching beyond this function.
+// custom-vs-fixture branching beyond this function. Every field is
+// optional and falls back to a sensible default instead of rejecting the
+// input — the point of "paste your own data" is to try whatever JSON is on
+// hand, not to force it into an exact schema. The only hard requirements
+// are that it's valid JSON and the top level is an object.
 function parseCustomData(jsonText) {
   let data;
   try {
@@ -322,47 +395,62 @@ function parseCustomData(jsonText) {
   } catch (e) {
     throw new Error(`Invalid JSON: ${e.message}`);
   }
-  if (!data || typeof data !== 'object') throw new Error('Top-level value must be a JSON object.');
-
-  const a = data.alert;
-  if (!a || typeof a !== 'object') throw new Error('"alert" object is required.');
-  for (const field of ['service', 'title', 'message', 'severity']) {
-    if (!a[field]) throw new Error(`alert.${field} is required.`);
+  if (!data || typeof data !== 'object' || Array.isArray(data)) {
+    throw new Error('Top-level value must be a JSON object.');
   }
-  const firedAt = parseDate(a.fired_at, 'alert.fired_at');
-  const receivedAt = a.received_at ? parseDate(a.received_at, 'alert.received_at') : firedAt;
+  if (!KNOWN_TOP_LEVEL_KEYS.some(k => k in data)) {
+    data = wrapAsSingleLogEntry(data);
+  }
 
-  const logs = Array.isArray(data.logs) ? data.logs.map((l, i) => ({
-    timestamp: parseDate(l.timestamp, `logs[${i}].timestamp`),
-    level: String(l.level || 'info'),
-    service: String(l.service || a.service),
-    message: String(l.message || ''),
-  })) : [];
+  const a = asObject(data.alert);
+  const firedAt = parseDateLenient(a.fired_at) || new Date();
+  const receivedAt = parseDateLenient(a.received_at) || firedAt;
+  const severity = ['critical', 'warning', 'info'].includes(a.severity) ? a.severity : 'warning';
 
-  const deploys = Array.isArray(data.deploys) ? data.deploys.map((d, i) => ({
-    sha: String(d.sha || ''),
-    author: String(d.author || ''),
-    message: String(d.message || ''),
-    timestamp: parseDate(d.timestamp, `deploys[${i}].timestamp`),
-    url: String(d.url || ''),
-  })) : [];
+  const logs = Array.isArray(data.logs) ? data.logs.map(l => {
+    l = asObject(l);
+    return {
+      timestamp: parseDateLenient(l.timestamp) || new Date(),
+      level: String(l.level || 'info'),
+      service: String(l.service || a.service || 'unknown'),
+      message: String(l.message || ''),
+    };
+  }) : [];
 
-  const metrics = Array.isArray(data.metrics) ? data.metrics.map((m, i) => ({
-    name: String(m.name || `metric_${i}`),
-    unit: String(m.unit || ''),
-    points: Array.isArray(m.points) ? m.points.map((p, j) => ({
-      timestamp: parseDate(p.timestamp, `metrics[${i}].points[${j}].timestamp`),
-      value: Number(p.value),
-    })) : [],
-  })) : [];
+  const deploys = Array.isArray(data.deploys) ? data.deploys.map(d => {
+    d = asObject(d);
+    return {
+      sha: String(d.sha || ''),
+      author: String(d.author || ''),
+      message: String(d.message || ''),
+      timestamp: parseDateLenient(d.timestamp) || new Date(),
+      url: String(d.url || ''),
+    };
+  }) : [];
+
+  const metrics = Array.isArray(data.metrics) ? data.metrics.map((m, i) => {
+    m = asObject(m);
+    return {
+      name: String(m.name || `metric_${i}`),
+      unit: String(m.unit || ''),
+      points: Array.isArray(m.points) ? m.points.map(p => {
+        p = asObject(p);
+        return { timestamp: parseDateLenient(p.timestamp) || new Date(), value: Number(p.value) || 0 };
+      }) : [],
+    };
+  }) : [];
 
   const sourceErrors = Array.isArray(data.sourceErrors) ? data.sourceErrors.map(String) : [];
 
   return {
     alert: {
-      id: 'custom-alert', source: 'custom',
-      service: a.service, title: a.title, message: a.message, severity: a.severity,
-      labels: a.labels || {}, fired_at: firedAt, received_at: receivedAt,
+      id: 'custom-alert', source: a.source ? String(a.source) : 'custom',
+      service: a.service ? String(a.service) : 'unknown',
+      title: a.title ? String(a.title) : '(untitled alert)',
+      message: a.message ? String(a.message) : '',
+      severity,
+      labels: asObject(a.labels),
+      fired_at: firedAt, received_at: receivedAt,
     },
     logs, deploys, metrics, sourceErrors,
   };
@@ -377,10 +465,12 @@ let webllmEngine = null;
 let webllmModule = null;
 let modelTierIndex = 0;
 
-// Which backend answers "Investigate": 'webllm' (free, runs locally) or
-// 'claude' (calls the real Anthropic API with a user-supplied key).
+// Which backend answers "Investigate": 'free' (this server's own
+// rate-limited Claude proxy, no key needed), 'claude' (the real Anthropic
+// API called directly with a user-supplied key), or 'webllm' (a small
+// model run entirely in the browser).
 const CLAUDE_KEY_STORAGE = 'incident-agent-claude-api-key';
-let backend = 'webllm';
+let backend = 'free';
 let claudeApiKey = localStorage.getItem(CLAUDE_KEY_STORAGE) || '';
 
 function log(kind, msg) {
@@ -425,7 +515,7 @@ function selectScenario(s) {
 function renderAlert(s) {
   if (s.custom) {
     alertBox.innerHTML = `
-      <p class="hint">Paste JSON with <code>alert</code>, <code>logs</code>, <code>deploys</code>, <code>metrics</code>, and (optionally) <code>sourceErrors</code> — same field names as <code>internal/alert.Alert</code> and <code>internal/sources</code>. Timestamps are any string <code>Date</code> can parse (ISO 8601 recommended).</p>
+      <p class="hint">Paste any JSON object — every field is optional and missing/malformed ones just fall back to a default, so partial or off-shape data still works. For the richest report, use <code>alert</code>, <code>logs</code>, <code>deploys</code>, <code>metrics</code>, and <code>sourceErrors</code> — same field names as <code>internal/alert.Alert</code> and <code>internal/sources</code>. If none of those keys are present at all (e.g. you pasted one raw structured-logger line), it's treated as a single log entry and its timestamp/level/service/message are guessed from common field names. Timestamps are any string <code>Date</code> can parse (ISO 8601 recommended).</p>
       <textarea id="customDataInput" class="custom-input" rows="16" spellcheck="false"></textarea>
       <div id="customDataStatus" class="hint"></div>
     `;
@@ -492,23 +582,27 @@ fireBtn.addEventListener('click', async () => {
   log('ok', 'context gathered — ready to investigate');
 });
 
-// --- backend selection (in-browser WebLLM vs. the real Claude API) -----
+// --- backend selection (server free tier / bring-your-own-key / WebLLM) -
 
 function updateInvestigateEnabled() {
-  investigateBtn.disabled = !contextGathered || (backend === 'claude' ? !claudeApiKey : !webllmEngine);
+  if (!contextGathered) { investigateBtn.disabled = true; return; }
+  investigateBtn.disabled = backend === 'claude' ? !claudeApiKey : backend === 'webllm' ? !webllmEngine : false;
 }
 
 function setBackend(next) {
   backend = next;
-  backendWebllmBtn.classList.toggle('active', backend === 'webllm');
+  backendFreeBtn.classList.toggle('active', backend === 'free');
   backendClaudeBtn.classList.toggle('active', backend === 'claude');
-  webllmPanel.style.display = backend === 'webllm' ? '' : 'none';
+  backendWebllmBtn.classList.toggle('active', backend === 'webllm');
+  freePanel.style.display = backend === 'free' ? '' : 'none';
   claudePanel.style.display = backend === 'claude' ? '' : 'none';
+  webllmPanel.style.display = backend === 'webllm' ? '' : 'none';
   updateInvestigateEnabled();
 }
 
-backendWebllmBtn.addEventListener('click', () => setBackend('webllm'));
+backendFreeBtn.addEventListener('click', () => setBackend('free'));
 backendClaudeBtn.addEventListener('click', () => setBackend('claude'));
+backendWebllmBtn.addEventListener('click', () => setBackend('webllm'));
 
 claudeApiKeyInput.value = claudeApiKey;
 saveKeyBtn.addEventListener('click', () => {
@@ -529,11 +623,8 @@ saveKeyBtn.addEventListener('click', () => {
 if (!navigator.gpu) {
   loadModelBtn.disabled = true;
   loadModelBtn.title = 'Requires a WebGPU-capable browser (e.g. desktop Chrome or Edge).';
-  aiStatus.textContent = 'Your browser does not support WebGPU, so the in-browser AI model can\'t run here. Switched to the Claude API tab below.';
-  setBackend('claude');
-} else {
-  setBackend('webllm');
 }
+setBackend('free');
 
 // Start with the lightest model so the demo works on constrained GPUs
 // without needing a device-lost fallback in the common case.
@@ -636,6 +727,27 @@ async function runClaudeApi(userMessage) {
   return (data.content || []).filter(b => b.type === 'text').map(b => b.text).join('');
 }
 
+// Calls this same server's own POST /api/investigate (cmd/server) - no key
+// needed, since the server holds one and rate-limits per IP + globally per
+// day. It runs the exact internal/agent pipeline and returns an
+// already-parsed report (see internal/agent.Report), not raw model text -
+// there is no JSON-parsing step for this backend, unlike the other two.
+async function runFreeApi(s) {
+  const res = await fetch('/api/investigate', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      alert: s.alert, logs: s.logs, deploys: s.deploys, metrics: s.metrics, sourceErrors: s.sourceErrors,
+    }),
+  });
+  let data = null;
+  try { data = await res.json(); } catch { /* body wasn't JSON (e.g. a 404 HTML page) */ }
+  if (!res.ok) {
+    throw new Error((data && data.error) || `HTTP ${res.status}`);
+  }
+  return data;
+}
+
 investigateBtn.addEventListener('click', async () => {
   if (!contextGathered) return;
   if (backend === 'webllm' && !webllmEngine) return;
@@ -644,24 +756,31 @@ investigateBtn.addEventListener('click', async () => {
   reportBox.innerHTML = '';
   aiStatus.textContent = 'Investigating…';
   const s = activeScenario;
-  const userMessage = buildUserMessage(s.alert, s.logs, s.deploys, s.metrics, s.sourceErrors);
   const started = performance.now();
-  log('ok', backend === 'claude'
-    ? 'asking Claude (claude-haiku-4-5) to investigate (same system prompt as internal/agent/prompt.go)...'
-    : 'asking the model to investigate (same system prompt as internal/agent/prompt.go)...');
+  log('ok', backend === 'free'
+    ? 'asking Claude (free tier, via this server) to investigate...'
+    : backend === 'claude'
+      ? 'asking Claude (claude-haiku-4-5) to investigate (same system prompt as internal/agent/prompt.go)...'
+      : 'asking the model to investigate (same system prompt as internal/agent/prompt.go)...');
   try {
-    const raw = backend === 'claude' ? await runClaudeApi(userMessage) : await runWebLLM(userMessage);
-    const elapsed = ((performance.now() - started) / 1000).toFixed(1);
     let report;
-    try {
-      report = parseModelResponse(raw);
-    } catch (e) {
-      reportBox.innerHTML = `<div class="hint">Model response could not be parsed as JSON. Raw output:</div><pre class="raw">${escapeHtml(raw)}</pre>`;
-      aiStatus.textContent = `Parse failed after ${elapsed}s — see raw output below.`;
-      log('err', `could not parse model response as JSON`);
-      updateInvestigateEnabled();
-      return;
+    if (backend === 'free') {
+      report = await runFreeApi(s);
+    } else {
+      const userMessage = buildUserMessage(s.alert, s.logs, s.deploys, s.metrics, s.sourceErrors);
+      const raw = backend === 'claude' ? await runClaudeApi(userMessage) : await runWebLLM(userMessage);
+      try {
+        report = parseModelResponse(raw);
+      } catch (e) {
+        const elapsed = ((performance.now() - started) / 1000).toFixed(1);
+        reportBox.innerHTML = `<div class="hint">Model response could not be parsed as JSON. Raw output:</div><pre class="raw">${escapeHtml(raw)}</pre>`;
+        aiStatus.textContent = `Parse failed after ${elapsed}s — see raw output below.`;
+        log('err', `could not parse model response as JSON`);
+        updateInvestigateEnabled();
+        return;
+      }
     }
+    const elapsed = ((performance.now() - started) / 1000).toFixed(1);
     renderReport(report);
     aiStatus.textContent = `Report generated in ${elapsed}s.`;
     log('ok', `investigation complete in ${elapsed}s`);

@@ -92,9 +92,10 @@
     用意されたインシデントシナリオを選んで「アラート発火」させると、ログ・デプロイ履歴・
     メトリクスを収集し、LLMに渡して構造化された根本原因レポートを生成する様子を体験できます。
     システムプロンプトとコンテキスト整形ロジックは<code>internal/agent/prompt.go</code>と一字一句同じもの。
-    下で回答役のモデルを選べます — ブラウザ内で完全ローカル実行する小型モデル
-    （WebLLM/WebGPU、無料・キー不要だが出力の質は粗め）か、自分のAPIキーで
-    呼び出す本物のClaude API（本番と同じバックエンド）です。
+    デフォルトではキー不要で本物のClaudeレポートが得られます——このサイト自身の
+    サーバーがレート制限付きの無料枠でリクエストを中継します。無制限に使いたい
+    場合は自分のキーを、あるいはブラウザ内で小型モデルを完全ローカル実行する
+    こともできます。
     <a href="https://github.com/shogohida/incident-agent" target="_blank" rel="noopener">ソースコード</a>
   </p>
 </header>
@@ -123,22 +124,27 @@
     <div class="panel">
       <h2>調査</h2>
       <div class="row">
-        <button id="backendWebllmBtn" class="secondary">ブラウザ内AI（無料）</button>
+        <button id="backendFreeBtn" class="secondary">Claude API（無料枠）</button>
         <button id="backendClaudeBtn" class="secondary">Claude API（自分のキー）</button>
+        <button id="backendWebllmBtn" class="secondary">ブラウザ内AI（無料）</button>
       </div>
 
-      <div id="webllmPanel">
-        <p class="hint">WebGPUでブラウザ内に小型モデルを完全ローカル実行します。無料・キー不要ですが、小型モデルは間違いが多く、端末によってはGPUメモリ不足になることがあります。</p>
-        <div class="row">
-          <button id="loadModelBtn">AIモデルを読み込む（初回のみ約1GB）</button>
-        </div>
+      <div id="freePanel">
+        <p class="hint">このサイト自身のサーバーを経由して本物のClaude APIを呼び出します — キー不要です。共有の無料枠のためレート制限があります（訪問者ごとに1時間あたり数回程度）。上限に達したら、他の2つの方法に切り替えてください。</p>
       </div>
 
       <div id="claudePanel" style="display:none">
-        <p class="hint">本番と同じClaude APIを直接呼び出します。ブラウザ内モデルよりずっと安定した結果が得られます。APIキーはこのブラウザからAnthropicへ直接送信され、このブラウザのローカルストレージにのみ保存されます — 弊社のサーバーには一切触れません。キーの取得は<a href="https://console.anthropic.com/settings/keys" target="_blank" rel="noopener">console.anthropic.com</a>から。</p>
+        <p class="hint">ユーザー自身のキーでブラウザから直接Claude APIを呼び出します — このサイトのレート制限を受けません。APIキーはこのブラウザからAnthropicへ直接送信され、このブラウザのローカルストレージにのみ保存されます — 弊社のサーバーには一切触れません。キーの取得は<a href="https://console.anthropic.com/settings/keys" target="_blank" rel="noopener">console.anthropic.com</a>から。</p>
         <div class="row">
           <input id="claudeApiKey" type="password" placeholder="sk-ant-..." class="key-input" autocomplete="off">
           <button id="saveKeyBtn" class="secondary">キーを保存</button>
+        </div>
+      </div>
+
+      <div id="webllmPanel" style="display:none">
+        <p class="hint">WebGPUでブラウザ内に小型モデルを完全ローカル実行します。無料・キー不要・レート制限もありませんが、小型モデルは間違いが多く、端末によってはGPUメモリ不足になることがあります。</p>
+        <div class="row">
+          <button id="loadModelBtn">AIモデルを読み込む（初回のみ約1GB）</button>
         </div>
       </div>
 

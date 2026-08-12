@@ -3,10 +3,16 @@
 // 実運用ログに相当する内容は、実際のシステムでも英語であることが自然なため
 // 原文のまま）。システムプロンプトとコンテキスト整形は
 // internal/agent/prompt.go と一字一句同じロジックを使用。推論バックエンドは
-// UIから選択式: ブラウザ内でWebLLM/WebGPUを使い小型モデルを完全ローカル実行
-// （無料・キー不要だが、小型モデルは間違いが多くGPUメモリ不足になることも
-// ある）か、ユーザー自身のAPIキーでブラウザから直接Claude APIを呼ぶか
-// （本番と同じバックエンド）。
+// UIから選択式:
+//   - 'free'   - このサーバー自身のPOST /api/investigate。運営者が支払う
+//                キーに対して実際のinternal/agentパイプラインを実行し、
+//                サーバー側（cmd/server）でレート制限をかけるため、訪問者
+//                は自分のキーを用意する必要がない。デフォルト。
+//   - 'claude' - ユーザー自身のAPIキーでブラウザから直接Claude APIを呼ぶ
+//                （runClaudeApi参照）。
+//   - 'webllm' - WebLLM/WebGPUで小型モデルをブラウザ内に完全ローカル実行
+//                （無料・サーバー不要だが、小型モデルは間違いが多くGPU
+//                メモリ不足になることもある。runWebLLM参照）。
 
 function minutesAgo(now, m) { return new Date(now.getTime() - m * 60000); }
 function secondsAgo(now, s) { return new Date(now.getTime() - s * 1000); }
@@ -268,10 +274,12 @@ const investigateBtn = document.getElementById('investigateBtn');
 const aiStatus = document.getElementById('aiStatus');
 const reportBox = document.getElementById('reportBox');
 const logEl = document.getElementById('log');
-const backendWebllmBtn = document.getElementById('backendWebllmBtn');
+const backendFreeBtn = document.getElementById('backendFreeBtn');
 const backendClaudeBtn = document.getElementById('backendClaudeBtn');
-const webllmPanel = document.getElementById('webllmPanel');
+const backendWebllmBtn = document.getElementById('backendWebllmBtn');
+const freePanel = document.getElementById('freePanel');
 const claudePanel = document.getElementById('claudePanel');
+const webllmPanel = document.getElementById('webllmPanel');
 const claudeApiKeyInput = document.getElementById('claudeApiKey');
 const saveKeyBtn = document.getElementById('saveKeyBtn');
 
@@ -310,15 +318,81 @@ function buildCustomTemplate(now) {
   return JSON.stringify(example, null, 2);
 }
 
-function parseDate(v, fieldName) {
+// 値からDateを返す。値が欠落・パース不能な場合はnullを返す——呼び出し側は
+// 1つの不正/欠落タイムスタンプだけでペイロード全体を拒否せず、デフォルトに
+// フォールバックする。
+function parseDateLenient(v) {
+  if (v === undefined || v === null || v === '') return null;
   const d = new Date(v);
-  if (isNaN(d.getTime())) throw new Error(`${fieldName} は有効な日時ではありません: ${JSON.stringify(v)}`);
-  return d;
+  return isNaN(d.getTime()) ? null : d;
+}
+
+function asObject(v) {
+  return v && typeof v === 'object' && !Array.isArray(v) ? v : {};
+}
+
+function firstDefined(obj, keys) {
+  for (const k of keys) {
+    if (obj[k] !== undefined && obj[k] !== null && obj[k] !== '') return obj[k];
+  }
+  return undefined;
+}
+
+// エポック値の推定: 13桁の数値はミリ秒だが、構造化ロガーの多く（このコード
+// の元になったサンプルも含む）は10桁のエポック秒を出力する。そのまま
+// `new Date()`に渡すと1970年になってしまうため、1e12未満は秒とみなす。
+function parseTimestampGuess(v) {
+  if (v === undefined || v === null || v === '') return null;
+  if (typeof v === 'number') {
+    const d = new Date(v < 1e12 ? v * 1000 : v);
+    return isNaN(d.getTime()) ? null : d;
+  }
+  return parseDateLenient(v);
+}
+
+const LOG_LEVEL_TO_SEVERITY = {
+  error: 'critical', fatal: 'critical', critical: 'critical', panic: 'critical',
+  warn: 'warning', warning: 'warning',
+  info: 'info', debug: 'info', trace: 'info',
+};
+const KNOWN_TOP_LEVEL_KEYS = ['alert', 'logs', 'deploys', 'metrics', 'sourceErrors'];
+const MAX_WRAPPED_MESSAGE_CHARS = 4000;
+
+// 多くの構造化ロガー（Datadog Forwarder、CloudWatchなど）はログ1行につき
+// フラットなJSONオブジェクトを1つ出力する——{alert, logs, ...}という形には
+// 包まれていない。貼り付けられたJSONに既知のトップレベルキーが1つも
+// なければ、それをまさに「ログ1行」として扱う。ロガーがよく使うフィールド
+// 名からtimestamp/level/service/messageを推測し、オブジェクト全体を
+// JSON.stringifyしてログメッセージに含めることで、認識できなかった内容も
+// 黙って捨てずにLLMへの証拠として残す。
+function wrapAsSingleLogEntry(data) {
+  const level = String(firstDefined(data, ['level', 'severity', 'log_level', 'logLevel']) || 'info').toLowerCase();
+  const service = firstDefined(data, ['service', 'service_name', 'serviceName', 'app', 'application', 'host', 'component']);
+  const messageField = firstDefined(data, ['message', 'msg', 'error_message', 'errorMessage', 'description', 'text']);
+  const timestamp = (parseTimestampGuess(firstDefined(data, ['timestamp', 'ts', 'time', 'date', 'datetime'])) || new Date()).toISOString();
+
+  let raw = JSON.stringify(data);
+  if (raw.length > MAX_WRAPPED_MESSAGE_CHARS) raw = raw.slice(0, MAX_WRAPPED_MESSAGE_CHARS) + '…(truncated)';
+  const message = messageField ? `${messageField} — ${raw}` : raw;
+
+  return {
+    alert: {
+      service, title: messageField ? String(messageField).slice(0, 140) : undefined,
+      message, severity: LOG_LEVEL_TO_SEVERITY[level] || 'warning', fired_at: timestamp,
+    },
+    logs: [{ timestamp, level, service, message }],
+    deploys: [], metrics: [], sourceErrors: [],
+  };
 }
 
 // 貼り付けられたJSONをbuildScenarios()と同じ形状にパースする。
 // これにより以降の処理（renderContext、buildUserMessageなど）は
-// カスタムデータかどうかをこの関数の外で意識する必要がない。
+// カスタムデータかどうかをこの関数の外で意識する必要がない。すべての
+// フィールドは任意で、欠落・不正な場合は妥当なデフォルト値にフォール
+// バックする（拒否しない）——「独自データを貼り付け」の狙いは手元にある
+// JSONをそのまま試せることであり、厳密なスキーマへの適合を強制すること
+// ではない。必須なのは有効なJSONであることとトップレベルがオブジェクト
+// であることのみ。
 function parseCustomData(jsonText) {
   let data;
   try {
@@ -326,47 +400,62 @@ function parseCustomData(jsonText) {
   } catch (e) {
     throw new Error(`JSONが不正です: ${e.message}`);
   }
-  if (!data || typeof data !== 'object') throw new Error('トップレベルはJSONオブジェクトである必要があります。');
-
-  const a = data.alert;
-  if (!a || typeof a !== 'object') throw new Error('"alert" オブジェクトが必要です。');
-  for (const field of ['service', 'title', 'message', 'severity']) {
-    if (!a[field]) throw new Error(`alert.${field} は必須です。`);
+  if (!data || typeof data !== 'object' || Array.isArray(data)) {
+    throw new Error('トップレベルはJSONオブジェクトである必要があります。');
   }
-  const firedAt = parseDate(a.fired_at, 'alert.fired_at');
-  const receivedAt = a.received_at ? parseDate(a.received_at, 'alert.received_at') : firedAt;
+  if (!KNOWN_TOP_LEVEL_KEYS.some(k => k in data)) {
+    data = wrapAsSingleLogEntry(data);
+  }
 
-  const logs = Array.isArray(data.logs) ? data.logs.map((l, i) => ({
-    timestamp: parseDate(l.timestamp, `logs[${i}].timestamp`),
-    level: String(l.level || 'info'),
-    service: String(l.service || a.service),
-    message: String(l.message || ''),
-  })) : [];
+  const a = asObject(data.alert);
+  const firedAt = parseDateLenient(a.fired_at) || new Date();
+  const receivedAt = parseDateLenient(a.received_at) || firedAt;
+  const severity = ['critical', 'warning', 'info'].includes(a.severity) ? a.severity : 'warning';
 
-  const deploys = Array.isArray(data.deploys) ? data.deploys.map((d, i) => ({
-    sha: String(d.sha || ''),
-    author: String(d.author || ''),
-    message: String(d.message || ''),
-    timestamp: parseDate(d.timestamp, `deploys[${i}].timestamp`),
-    url: String(d.url || ''),
-  })) : [];
+  const logs = Array.isArray(data.logs) ? data.logs.map(l => {
+    l = asObject(l);
+    return {
+      timestamp: parseDateLenient(l.timestamp) || new Date(),
+      level: String(l.level || 'info'),
+      service: String(l.service || a.service || 'unknown'),
+      message: String(l.message || ''),
+    };
+  }) : [];
 
-  const metrics = Array.isArray(data.metrics) ? data.metrics.map((m, i) => ({
-    name: String(m.name || `metric_${i}`),
-    unit: String(m.unit || ''),
-    points: Array.isArray(m.points) ? m.points.map((p, j) => ({
-      timestamp: parseDate(p.timestamp, `metrics[${i}].points[${j}].timestamp`),
-      value: Number(p.value),
-    })) : [],
-  })) : [];
+  const deploys = Array.isArray(data.deploys) ? data.deploys.map(d => {
+    d = asObject(d);
+    return {
+      sha: String(d.sha || ''),
+      author: String(d.author || ''),
+      message: String(d.message || ''),
+      timestamp: parseDateLenient(d.timestamp) || new Date(),
+      url: String(d.url || ''),
+    };
+  }) : [];
+
+  const metrics = Array.isArray(data.metrics) ? data.metrics.map((m, i) => {
+    m = asObject(m);
+    return {
+      name: String(m.name || `metric_${i}`),
+      unit: String(m.unit || ''),
+      points: Array.isArray(m.points) ? m.points.map(p => {
+        p = asObject(p);
+        return { timestamp: parseDateLenient(p.timestamp) || new Date(), value: Number(p.value) || 0 };
+      }) : [],
+    };
+  }) : [];
 
   const sourceErrors = Array.isArray(data.sourceErrors) ? data.sourceErrors.map(String) : [];
 
   return {
     alert: {
-      id: 'custom-alert', source: 'custom',
-      service: a.service, title: a.title, message: a.message, severity: a.severity,
-      labels: a.labels || {}, fired_at: firedAt, received_at: receivedAt,
+      id: 'custom-alert', source: a.source ? String(a.source) : 'custom',
+      service: a.service ? String(a.service) : 'unknown',
+      title: a.title ? String(a.title) : '（タイトルなし）',
+      message: a.message ? String(a.message) : '',
+      severity,
+      labels: asObject(a.labels),
+      fired_at: firedAt, received_at: receivedAt,
     },
     logs, deploys, metrics, sourceErrors,
   };
@@ -381,10 +470,11 @@ let webllmEngine = null;
 let webllmModule = null;
 let modelTierIndex = 0;
 
-// 「調査を開始」に応答するバックエンド: 'webllm'（無料・ローカル実行）か
-// 'claude'（ユーザー自身のキーで本物のAnthropic APIを呼ぶ）か。
+// 「調査を開始」に応答するバックエンド: 'free'（このサーバー自身のレート
+// 制限付きClaudeプロキシ、キー不要）、'claude'（ユーザー自身のキーで本物の
+// Anthropic APIを直接呼ぶ）、'webllm'（ブラウザ内で小型モデルを実行）。
 const CLAUDE_KEY_STORAGE = 'incident-agent-claude-api-key';
-let backend = 'webllm';
+let backend = 'free';
 let claudeApiKey = localStorage.getItem(CLAUDE_KEY_STORAGE) || '';
 
 function log(kind, msg) {
@@ -430,7 +520,7 @@ function selectScenario(s) {
 function renderAlert(s) {
   if (s.custom) {
     alertBox.innerHTML = `
-      <p class="hint"><code>alert</code>、<code>logs</code>、<code>deploys</code>、<code>metrics</code>、（任意で）<code>sourceErrors</code>を含むJSONを貼り付けてください — <code>internal/alert.Alert</code>・<code>internal/sources</code>と同じフィールド名です。タイムスタンプは<code>Date</code>でパースできる文字列なら何でも構いません（ISO 8601推奨）。</p>
+      <p class="hint">任意のJSONオブジェクトを貼り付けられます — すべてのフィールドは任意で、欠落・不正な値は自動的にデフォルトへフォールバックするため、部分的なデータや形の違うデータでも動作します。最も詳細なレポートを得るには<code>alert</code>、<code>logs</code>、<code>deploys</code>、<code>metrics</code>、<code>sourceErrors</code>（<code>internal/alert.Alert</code>・<code>internal/sources</code>と同じフィールド名）を使ってください。これらのキーが1つも無い場合（構造化ロガーの生ログ1行をそのまま貼り付けた場合など）は、ログ1件として扱い、よくあるフィールド名からtimestamp/level/service/messageを推測します。タイムスタンプは<code>Date</code>でパースできる文字列なら何でも構いません（ISO 8601推奨）。</p>
       <textarea id="customDataInput" class="custom-input" rows="16" spellcheck="false"></textarea>
       <div id="customDataStatus" class="hint"></div>
     `;
@@ -497,23 +587,27 @@ fireBtn.addEventListener('click', async () => {
   log('ok', 'コンテキスト収集完了 — 調査を開始できます');
 });
 
-// --- バックエンド選択（ブラウザ内WebLLM vs. 本物のClaude API） ---
+// --- バックエンド選択（サーバー無料枠 / 自分のキー / ブラウザ内WebLLM） ---
 
 function updateInvestigateEnabled() {
-  investigateBtn.disabled = !contextGathered || (backend === 'claude' ? !claudeApiKey : !webllmEngine);
+  if (!contextGathered) { investigateBtn.disabled = true; return; }
+  investigateBtn.disabled = backend === 'claude' ? !claudeApiKey : backend === 'webllm' ? !webllmEngine : false;
 }
 
 function setBackend(next) {
   backend = next;
-  backendWebllmBtn.classList.toggle('active', backend === 'webllm');
+  backendFreeBtn.classList.toggle('active', backend === 'free');
   backendClaudeBtn.classList.toggle('active', backend === 'claude');
-  webllmPanel.style.display = backend === 'webllm' ? '' : 'none';
+  backendWebllmBtn.classList.toggle('active', backend === 'webllm');
+  freePanel.style.display = backend === 'free' ? '' : 'none';
   claudePanel.style.display = backend === 'claude' ? '' : 'none';
+  webllmPanel.style.display = backend === 'webllm' ? '' : 'none';
   updateInvestigateEnabled();
 }
 
-backendWebllmBtn.addEventListener('click', () => setBackend('webllm'));
+backendFreeBtn.addEventListener('click', () => setBackend('free'));
 backendClaudeBtn.addEventListener('click', () => setBackend('claude'));
+backendWebllmBtn.addEventListener('click', () => setBackend('webllm'));
 
 claudeApiKeyInput.value = claudeApiKey;
 saveKeyBtn.addEventListener('click', () => {
@@ -534,11 +628,8 @@ saveKeyBtn.addEventListener('click', () => {
 if (!navigator.gpu) {
   loadModelBtn.disabled = true;
   loadModelBtn.title = 'WebGPU対応ブラウザが必要です（例：デスクトップ版Chrome/Edge）。';
-  aiStatus.textContent = 'お使いのブラウザはWebGPUに対応していないため、ブラウザ内AIモデルを実行できません。下のClaude APIタブに切り替えました。';
-  setBackend('claude');
-} else {
-  setBackend('webllm');
 }
+setBackend('free');
 
 // GPU性能が低い環境でも動くよう、最初から最も軽量なモデルを選択する。
 const PREFERRED_MODELS = ['Qwen2.5-0.5B-Instruct'];
@@ -639,6 +730,27 @@ async function runClaudeApi(userMessage) {
   return (data.content || []).filter(b => b.type === 'text').map(b => b.text).join('');
 }
 
+// このサーバー自身のPOST /api/investigate（cmd/server）を呼ぶ——キー不要。
+// サーバーがキーを保持し、IPごと・1日ごとにレート制限する。実際の
+// internal/agentパイプラインを実行し、パース済みのレポートを返す（
+// internal/agent.Report参照）。他の2バックエンドと違い、この経路には
+// JSONパース処理が存在しない。
+async function runFreeApi(s) {
+  const res = await fetch('/api/investigate', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      alert: s.alert, logs: s.logs, deploys: s.deploys, metrics: s.metrics, sourceErrors: s.sourceErrors,
+    }),
+  });
+  let data = null;
+  try { data = await res.json(); } catch { /* ボディがJSONでなかった（404のHTMLページなど） */ }
+  if (!res.ok) {
+    throw new Error((data && data.error) || `HTTP ${res.status}`);
+  }
+  return data;
+}
+
 investigateBtn.addEventListener('click', async () => {
   if (!contextGathered) return;
   if (backend === 'webllm' && !webllmEngine) return;
@@ -647,24 +759,31 @@ investigateBtn.addEventListener('click', async () => {
   reportBox.innerHTML = '';
   aiStatus.textContent = '調査中…';
   const s = activeScenario;
-  const userMessage = buildUserMessage(s.alert, s.logs, s.deploys, s.metrics, s.sourceErrors);
   const started = performance.now();
-  log('ok', backend === 'claude'
-    ? 'Claude（claude-haiku-4-5）に調査を依頼中（internal/agent/prompt.goと同一のシステムプロンプト）...'
-    : 'モデルに調査を依頼中（internal/agent/prompt.goと同一のシステムプロンプト）...');
+  log('ok', backend === 'free'
+    ? 'Claude（無料枠・このサーバー経由）に調査を依頼中...'
+    : backend === 'claude'
+      ? 'Claude（claude-haiku-4-5）に調査を依頼中（internal/agent/prompt.goと同一のシステムプロンプト）...'
+      : 'モデルに調査を依頼中（internal/agent/prompt.goと同一のシステムプロンプト）...');
   try {
-    const raw = backend === 'claude' ? await runClaudeApi(userMessage) : await runWebLLM(userMessage);
-    const elapsed = ((performance.now() - started) / 1000).toFixed(1);
     let report;
-    try {
-      report = parseModelResponse(raw);
-    } catch (e) {
-      reportBox.innerHTML = `<div class="hint">モデルの応答をJSONとしてパースできませんでした。生の出力:</div><pre class="raw">${escapeHtml(raw)}</pre>`;
-      aiStatus.textContent = `パース失敗（${elapsed}秒）— 下の生出力を参照してください。`;
-      log('err', `モデル応答のJSONパースに失敗`);
-      updateInvestigateEnabled();
-      return;
+    if (backend === 'free') {
+      report = await runFreeApi(s);
+    } else {
+      const userMessage = buildUserMessage(s.alert, s.logs, s.deploys, s.metrics, s.sourceErrors);
+      const raw = backend === 'claude' ? await runClaudeApi(userMessage) : await runWebLLM(userMessage);
+      try {
+        report = parseModelResponse(raw);
+      } catch (e) {
+        const elapsed = ((performance.now() - started) / 1000).toFixed(1);
+        reportBox.innerHTML = `<div class="hint">モデルの応答をJSONとしてパースできませんでした。生の出力:</div><pre class="raw">${escapeHtml(raw)}</pre>`;
+        aiStatus.textContent = `パース失敗（${elapsed}秒）— 下の生出力を参照してください。`;
+        log('err', `モデル応答のJSONパースに失敗`);
+        updateInvestigateEnabled();
+        return;
+      }
     }
+    const elapsed = ((performance.now() - started) / 1000).toFixed(1);
     renderReport(report);
     aiStatus.textContent = `${elapsed}秒でレポートを生成しました。`;
     log('ok', `調査完了（${elapsed}秒）`);
