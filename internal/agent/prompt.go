@@ -37,7 +37,8 @@ before or after) matching exactly this shape:
 }
 List root_cause_hypotheses from most to least likely. If no deploys look
 suspicious, return an empty array for suspicious_deploys rather than
-omitting the field.`
+omitting the field. recommended_actions must always contain at least one
+concrete next step, even if it is only to gather more evidence.`
 
 // buildUserMessage renders the gathered incident context into the text the
 // model will reason over. Kept as a pure function (no I/O) so prompt

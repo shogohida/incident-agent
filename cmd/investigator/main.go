@@ -54,7 +54,7 @@ func buildLLMClient(provider, model string) (agent.ClaudeClient, error) {
 			return nil, fmt.Errorf("ANTHROPIC_API_KEY environment variable is not set (or pass -provider ollama to run for free against a local model)")
 		}
 		if model == "" {
-			model = "claude-sonnet-4-6"
+			model = "claude-haiku-4-5"
 		}
 		c := claude.NewClient(apiKey, model)
 		if base := os.Getenv("ANTHROPIC_BASE_URL"); base != "" {
@@ -99,7 +99,7 @@ func runInvestigate(args []string) error {
 	githubToken := fs.String("github-token", os.Getenv("GITHUB_TOKEN"), "optional GitHub token (raises API rate limit)")
 	slackWebhook := fs.String("slack-webhook", "", "optional Slack incoming webhook URL to also post the report to")
 	provider := fs.String("provider", "", "LLM backend: claude|ollama (default: claude if ANTHROPIC_API_KEY is set, else ollama)")
-	model := fs.String("model", "", "model to use (default claude-sonnet-4-6, or llama3.1 for -provider ollama)")
+	model := fs.String("model", "", "model to use (default claude-haiku-4-5, or llama3.1 for -provider ollama)")
 	lookback := fs.Duration("lookback", 30*time.Minute, "how far back to search logs/deploys")
 	timeout := fs.Duration("timeout", 2*time.Minute, "overall investigation timeout (raise this for -provider ollama on modest hardware, where local CPU inference can be much slower than the Claude API)")
 	fs.Parse(args)
@@ -156,7 +156,7 @@ func runServe(args []string) error {
 	githubToken := fs.String("github-token", os.Getenv("GITHUB_TOKEN"), "optional GitHub token")
 	slackWebhook := fs.String("slack-webhook", "", "Slack incoming webhook URL to post reports to")
 	provider := fs.String("provider", "", "LLM backend: claude|ollama (default: claude if ANTHROPIC_API_KEY is set, else ollama)")
-	model := fs.String("model", "", "model to use (default claude-sonnet-4-6, or llama3.1 for -provider ollama)")
+	model := fs.String("model", "", "model to use (default claude-haiku-4-5, or llama3.1 for -provider ollama)")
 	timeout := fs.Duration("timeout", 2*time.Minute, "per-alert investigation timeout (raise this for -provider ollama on modest hardware, where local CPU inference can be much slower than the Claude API)")
 	fs.Parse(args)
 

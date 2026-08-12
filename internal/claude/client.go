@@ -28,7 +28,7 @@ type Client struct {
 }
 
 // NewClient creates a client. model can be any valid Claude model string
-// (e.g. "claude-sonnet-4-6"); apiKey is read by the caller from the
+// (e.g. "claude-haiku-4-5"); apiKey is read by the caller from the
 // ANTHROPIC_API_KEY environment variable by convention (see cmd/investigator).
 func NewClient(apiKey, model string) *Client {
 	return &Client{
