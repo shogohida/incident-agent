@@ -77,6 +77,10 @@
   .hypothesis ul { margin: 4px 0 0; padding-left: 18px; color: var(--muted); font-size: 0.8rem; }
   .report-summary { margin-bottom: 8px; }
   pre.raw { white-space: pre-wrap; font-size: 0.75rem; background: #0d1017; border: 1px solid var(--border); border-radius: 6px; padding: 10px; max-height: 300px; overflow-y: auto; }
+  .custom-input { width: 100%; min-height: 260px; background: #0d1017; color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 10px; font-family: ui-monospace, monospace; font-size: 0.78rem; resize: vertical; }
+  .error-text { color: var(--bad); }
+  .key-input { flex: 1; min-width: 200px; background: #0d1017; color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px; font-family: ui-monospace, monospace; font-size: 0.8rem; }
+  button.secondary.active { background: var(--accent); color: #04101f; border-color: var(--accent); }
 </style>
 </head>
 <body>
@@ -88,10 +92,10 @@
     Pick a canned incident, "fire" the alert, and watch the tool gather logs,
     deploy history, and metrics, then hand them to an LLM for a structured
     root-cause report. The system prompt and context formatting are copied
-    verbatim from <code>internal/agent/prompt.go</code> — the only thing
-    different from production is the model itself: this page runs a small
-    model entirely in your browser (WebLLM/WebGPU) instead of calling the
-    Claude API, so the public demo never costs anything to run. See the
+    verbatim from <code>internal/agent/prompt.go</code>. Choose which model
+    answers below: a small model that runs entirely in your browser
+    (WebLLM/WebGPU, free, no key, but rougher output), or the real Claude
+    API with your own key — the same backend production uses. See the
     <a href="https://github.com/shogohida/incident-agent" target="_blank" rel="noopener">source</a>.
   </p>
 </header>
@@ -118,9 +122,28 @@
     </div>
 
     <div class="panel">
-      <h2>Investigate (runs entirely in your browser)</h2>
+      <h2>Investigate</h2>
       <div class="row">
-        <button id="loadModelBtn">Load AI model (~1GB, first time only)</button>
+        <button id="backendWebllmBtn" class="secondary">In-browser AI (free)</button>
+        <button id="backendClaudeBtn" class="secondary">Claude API (your key)</button>
+      </div>
+
+      <div id="webllmPanel">
+        <p class="hint">Runs a small model entirely in your browser via WebGPU. Free, no key needed — but small models make more mistakes and can run out of GPU memory on some devices.</p>
+        <div class="row">
+          <button id="loadModelBtn">Load AI model (~1GB, first time only)</button>
+        </div>
+      </div>
+
+      <div id="claudePanel" style="display:none">
+        <p class="hint">Calls the real Claude API — the same backend production uses, far more reliable than the in-browser model. Your key is sent directly from your browser to Anthropic and saved only in this browser's local storage; it never touches any server of ours. Get a key at <a href="https://console.anthropic.com/settings/keys" target="_blank" rel="noopener">console.anthropic.com</a>.</p>
+        <div class="row">
+          <input id="claudeApiKey" type="password" placeholder="sk-ant-..." class="key-input" autocomplete="off">
+          <button id="saveKeyBtn" class="secondary">Save key</button>
+        </div>
+      </div>
+
+      <div class="row">
         <button id="investigateBtn" class="secondary" disabled>Investigate</button>
       </div>
       <div id="aiStatus" class="ai-status"></div>

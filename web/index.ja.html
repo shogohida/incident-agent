@@ -77,6 +77,10 @@
   .hypothesis ul { margin: 4px 0 0; padding-left: 18px; color: var(--muted); font-size: 0.8rem; }
   .report-summary { margin-bottom: 8px; }
   pre.raw { white-space: pre-wrap; font-size: 0.75rem; background: #0d1017; border: 1px solid var(--border); border-radius: 6px; padding: 10px; max-height: 300px; overflow-y: auto; }
+  .custom-input { width: 100%; min-height: 260px; background: #0d1017; color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 10px; font-family: ui-monospace, monospace; font-size: 0.78rem; resize: vertical; }
+  .error-text { color: var(--bad); }
+  .key-input { flex: 1; min-width: 200px; background: #0d1017; color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px; font-family: ui-monospace, monospace; font-size: 0.8rem; }
+  button.secondary.active { background: var(--accent); color: #04101f; border-color: var(--accent); }
 </style>
 </head>
 <body>
@@ -87,9 +91,10 @@
   <p>
     用意されたインシデントシナリオを選んで「アラート発火」させると、ログ・デプロイ履歴・
     メトリクスを収集し、LLMに渡して構造化された根本原因レポートを生成する様子を体験できます。
-    システムプロンプトとコンテキスト整形ロジックは<code>internal/agent/prompt.go</code>と一字一句同じもの——
-    本番との違いはモデル本体のみで、このページではClaude APIの代わりに小型モデルをブラウザ内で
-    完全にローカル実行（WebLLM/WebGPU）するため、公開デモの運用コストはゼロです。
+    システムプロンプトとコンテキスト整形ロジックは<code>internal/agent/prompt.go</code>と一字一句同じもの。
+    下で回答役のモデルを選べます — ブラウザ内で完全ローカル実行する小型モデル
+    （WebLLM/WebGPU、無料・キー不要だが出力の質は粗め）か、自分のAPIキーで
+    呼び出す本物のClaude API（本番と同じバックエンド）です。
     <a href="https://github.com/shogohida/incident-agent" target="_blank" rel="noopener">ソースコード</a>
   </p>
 </header>
@@ -116,9 +121,28 @@
     </div>
 
     <div class="panel">
-      <h2>調査（ブラウザ内で完結）</h2>
+      <h2>調査</h2>
       <div class="row">
-        <button id="loadModelBtn">AIモデルを読み込む（初回のみ約1GB）</button>
+        <button id="backendWebllmBtn" class="secondary">ブラウザ内AI（無料）</button>
+        <button id="backendClaudeBtn" class="secondary">Claude API（自分のキー）</button>
+      </div>
+
+      <div id="webllmPanel">
+        <p class="hint">WebGPUでブラウザ内に小型モデルを完全ローカル実行します。無料・キー不要ですが、小型モデルは間違いが多く、端末によってはGPUメモリ不足になることがあります。</p>
+        <div class="row">
+          <button id="loadModelBtn">AIモデルを読み込む（初回のみ約1GB）</button>
+        </div>
+      </div>
+
+      <div id="claudePanel" style="display:none">
+        <p class="hint">本番と同じClaude APIを直接呼び出します。ブラウザ内モデルよりずっと安定した結果が得られます。APIキーはこのブラウザからAnthropicへ直接送信され、このブラウザのローカルストレージにのみ保存されます — 弊社のサーバーには一切触れません。キーの取得は<a href="https://console.anthropic.com/settings/keys" target="_blank" rel="noopener">console.anthropic.com</a>から。</p>
+        <div class="row">
+          <input id="claudeApiKey" type="password" placeholder="sk-ant-..." class="key-input" autocomplete="off">
+          <button id="saveKeyBtn" class="secondary">キーを保存</button>
+        </div>
+      </div>
+
+      <div class="row">
         <button id="investigateBtn" class="secondary" disabled>調査を開始</button>
       </div>
       <div id="aiStatus" class="ai-status"></div>

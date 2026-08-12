@@ -2,7 +2,11 @@
 // シナリオのタイトル/説明のみ翻訳している（ログ行やコミットメッセージなど
 // 実運用ログに相当する内容は、実際のシステムでも英語であることが自然なため
 // 原文のまま）。システムプロンプトとコンテキスト整形は
-// internal/agent/prompt.go と一字一句同じロジックを使用。
+// internal/agent/prompt.go と一字一句同じロジックを使用。推論バックエンドは
+// UIから選択式: ブラウザ内でWebLLM/WebGPUを使い小型モデルを完全ローカル実行
+// （無料・キー不要だが、小型モデルは間違いが多くGPUメモリ不足になることも
+// ある）か、ユーザー自身のAPIキーでブラウザから直接Claude APIを呼ぶか
+// （本番と同じバックエンド）。
 
 function minutesAgo(now, m) { return new Date(now.getTime() - m * 60000); }
 function secondsAgo(now, s) { return new Date(now.getTime() - s * 1000); }
@@ -149,7 +153,52 @@ before or after) matching exactly this shape:
 }
 List root_cause_hypotheses from most to least likely. If no deploys look
 suspicious, return an empty array for suspicious_deploys rather than
-omitting the field.`;
+omitting the field. recommended_actions must always contain at least one
+concrete next step, even if it is only to gather more evidence.
+
+Write every natural-language field (summary, hypothesis descriptions,
+evidence descriptions, recommended_actions, and suspicious_deploys
+descriptions) in clear, professional Japanese, since the reader is a
+Japanese-speaking on-call engineer. Do not translate the JSON field names.
+Keep "assessed_severity" exactly as one of the English literals "critical",
+"warning", or "info" - do not translate or localize that value. When an
+evidence string quotes a specific log line, commit message/SHA, or metric
+value verbatim from the context you were given, keep that quoted snippet
+in its original form rather than translating it, even though the
+surrounding sentence is in Japanese.`;
+
+// スキーマはオブジェクトとして共有する。WebLLMのresponse_format.schemaは
+// JSON文字列を要求するので、グラマー制約付きデコーディング（XGrammar）で
+// この形に一致する妥当なJSONの生成を強制できる（プロンプトの指示だけに頼ると
+// 小型モデルは「JSONのみで応答」を無視して散文を返すことがある）。Claude API
+// のoutput_config.formatはオブジェクトそのものを要求し、structured outputs
+// によって同じ保証が得られる。
+const REPORT_JSON_SCHEMA_OBJ = {
+  type: 'object',
+  properties: {
+    summary: { type: 'string' },
+    assessed_severity: { type: 'string', enum: ['critical', 'warning', 'info'] },
+    confidence: { type: 'number' },
+    root_cause_hypotheses: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: {
+          description: { type: 'string' },
+          confidence: { type: 'number' },
+          evidence: { type: 'array', items: { type: 'string' } },
+        },
+        required: ['description', 'confidence', 'evidence'],
+        additionalProperties: false,
+      },
+    },
+    recommended_actions: { type: 'array', items: { type: 'string' }, minItems: 1 },
+    suspicious_deploys: { type: 'array', items: { type: 'string' } },
+  },
+  required: ['summary', 'assessed_severity', 'confidence', 'root_cause_hypotheses', 'recommended_actions', 'suspicious_deploys'],
+  additionalProperties: false,
+};
+const REPORT_JSON_SCHEMA = JSON.stringify(REPORT_JSON_SCHEMA_OBJ);
 
 function hhmmss(d) { return d.toISOString().slice(11, 19); }
 function shortSha(sha) { return sha.length > 8 ? sha.slice(0, 8) : sha; }
@@ -198,7 +247,16 @@ function buildUserMessage(alert, logs, deploys, metrics, sourceErrors) {
 function parseModelResponse(raw) {
   let text = raw.trim();
   text = text.replace(/^```json/, '').replace(/^```/, '').replace(/```$/, '').trim();
-  return JSON.parse(text);
+  try {
+    return JSON.parse(text);
+  } catch (e) {
+    // グラマー制約付きデコーディングが効かないモデル/バックエンド向けのフォールバック:
+    // 最初と最後の波括弧で囲まれた範囲を抜き出して再度パースを試みる。
+    const start = text.indexOf('{');
+    const end = text.lastIndexOf('}');
+    if (start === -1 || end === -1 || end <= start) throw e;
+    return JSON.parse(text.slice(start, end + 1));
+  }
 }
 
 const scenarioListEl = document.getElementById('scenarioList');
@@ -210,11 +268,124 @@ const investigateBtn = document.getElementById('investigateBtn');
 const aiStatus = document.getElementById('aiStatus');
 const reportBox = document.getElementById('reportBox');
 const logEl = document.getElementById('log');
+const backendWebllmBtn = document.getElementById('backendWebllmBtn');
+const backendClaudeBtn = document.getElementById('backendClaudeBtn');
+const webllmPanel = document.getElementById('webllmPanel');
+const claudePanel = document.getElementById('claudePanel');
+const claudeApiKeyInput = document.getElementById('claudeApiKey');
+const saveKeyBtn = document.getElementById('saveKeyBtn');
 
-let scenarios = buildScenarios(new Date());
+const CUSTOM_SCENARIO = {
+  id: 'custom', custom: true,
+  title: '独自データを貼り付け',
+  description: '自分のアラート・ログ・デプロイ・メトリクスをJSONで指定できます（internal/alert.Alert・internal/sourcesと同じフィールド名）。',
+  alert: null, logs: [], deploys: [], metrics: [], sourceErrors: [],
+};
+
+function buildCustomTemplate(now) {
+  const example = {
+    alert: {
+      service: 'checkout',
+      title: 'High 5xx error rate',
+      message: 'Error rate exceeded 5% for 3 minutes',
+      severity: 'critical',
+      fired_at: minutesAgo(now, 1).toISOString(),
+      labels: { env: 'production' },
+    },
+    logs: [
+      { timestamp: secondsAgo(now, 30).toISOString(), level: 'error', service: 'checkout', message: 'checkout failed: 500 Internal Server Error' },
+      { timestamp: minutesAgo(now, 4).toISOString(), level: 'info', service: 'checkout', message: 'deployed revision abc1234' },
+    ],
+    deploys: [
+      { sha: 'abc1234', author: 'you', message: 'describe the change here', timestamp: minutesAgo(now, 4).toISOString(), url: '' },
+    ],
+    metrics: [
+      { name: 'error_rate_5xx', unit: 'percent', points: [
+        { timestamp: minutesAgo(now, 5).toISOString(), value: 0.5 },
+        { timestamp: now.toISOString(), value: 6.2 },
+      ] },
+    ],
+    sourceErrors: [],
+  };
+  return JSON.stringify(example, null, 2);
+}
+
+function parseDate(v, fieldName) {
+  const d = new Date(v);
+  if (isNaN(d.getTime())) throw new Error(`${fieldName} は有効な日時ではありません: ${JSON.stringify(v)}`);
+  return d;
+}
+
+// 貼り付けられたJSONをbuildScenarios()と同じ形状にパースする。
+// これにより以降の処理（renderContext、buildUserMessageなど）は
+// カスタムデータかどうかをこの関数の外で意識する必要がない。
+function parseCustomData(jsonText) {
+  let data;
+  try {
+    data = JSON.parse(jsonText);
+  } catch (e) {
+    throw new Error(`JSONが不正です: ${e.message}`);
+  }
+  if (!data || typeof data !== 'object') throw new Error('トップレベルはJSONオブジェクトである必要があります。');
+
+  const a = data.alert;
+  if (!a || typeof a !== 'object') throw new Error('"alert" オブジェクトが必要です。');
+  for (const field of ['service', 'title', 'message', 'severity']) {
+    if (!a[field]) throw new Error(`alert.${field} は必須です。`);
+  }
+  const firedAt = parseDate(a.fired_at, 'alert.fired_at');
+  const receivedAt = a.received_at ? parseDate(a.received_at, 'alert.received_at') : firedAt;
+
+  const logs = Array.isArray(data.logs) ? data.logs.map((l, i) => ({
+    timestamp: parseDate(l.timestamp, `logs[${i}].timestamp`),
+    level: String(l.level || 'info'),
+    service: String(l.service || a.service),
+    message: String(l.message || ''),
+  })) : [];
+
+  const deploys = Array.isArray(data.deploys) ? data.deploys.map((d, i) => ({
+    sha: String(d.sha || ''),
+    author: String(d.author || ''),
+    message: String(d.message || ''),
+    timestamp: parseDate(d.timestamp, `deploys[${i}].timestamp`),
+    url: String(d.url || ''),
+  })) : [];
+
+  const metrics = Array.isArray(data.metrics) ? data.metrics.map((m, i) => ({
+    name: String(m.name || `metric_${i}`),
+    unit: String(m.unit || ''),
+    points: Array.isArray(m.points) ? m.points.map((p, j) => ({
+      timestamp: parseDate(p.timestamp, `metrics[${i}].points[${j}].timestamp`),
+      value: Number(p.value),
+    })) : [],
+  })) : [];
+
+  const sourceErrors = Array.isArray(data.sourceErrors) ? data.sourceErrors.map(String) : [];
+
+  return {
+    alert: {
+      id: 'custom-alert', source: 'custom',
+      service: a.service, title: a.title, message: a.message, severity: a.severity,
+      labels: a.labels || {}, fired_at: firedAt, received_at: receivedAt,
+    },
+    logs, deploys, metrics, sourceErrors,
+  };
+}
+
+const initNow = new Date();
+let scenarios = [...buildScenarios(initNow), CUSTOM_SCENARIO];
+let customInputValue = buildCustomTemplate(initNow);
 let activeScenario = scenarios[0];
 let contextGathered = false;
 let webllmEngine = null;
+let webllmModule = null;
+let modelTierIndex = 0;
+
+// 「調査を開始」に応答するバックエンド: 'webllm'（無料・ローカル実行）か
+// 'claude'（ユーザー自身のキーで本物のAnthropic APIを呼ぶ）か。
+const CLAUDE_KEY_STORAGE = 'incident-agent-claude-api-key';
+let backend = 'webllm';
+let claudeApiKey = localStorage.getItem(CLAUDE_KEY_STORAGE) || '';
 
 function log(kind, msg) {
   const div = document.createElement('div');
@@ -257,6 +428,17 @@ function selectScenario(s) {
 }
 
 function renderAlert(s) {
+  if (s.custom) {
+    alertBox.innerHTML = `
+      <p class="hint"><code>alert</code>、<code>logs</code>、<code>deploys</code>、<code>metrics</code>、（任意で）<code>sourceErrors</code>を含むJSONを貼り付けてください — <code>internal/alert.Alert</code>・<code>internal/sources</code>と同じフィールド名です。タイムスタンプは<code>Date</code>でパースできる文字列なら何でも構いません（ISO 8601推奨）。</p>
+      <textarea id="customDataInput" class="custom-input" rows="16" spellcheck="false"></textarea>
+      <div id="customDataStatus" class="hint"></div>
+    `;
+    const ta = document.getElementById('customDataInput');
+    ta.value = customInputValue;
+    ta.addEventListener('input', () => { customInputValue = ta.value; });
+    return;
+  }
   const a = s.alert;
   alertBox.innerHTML = `
     <div class="alert-line">${severityBadge(a.severity)} <b>${a.title}</b></div>
@@ -283,8 +465,22 @@ function renderContext(s) {
 }
 
 fireBtn.addEventListener('click', async () => {
-  fireBtn.disabled = true;
   const s = activeScenario;
+  if (s.custom) {
+    const statusEl = document.getElementById('customDataStatus');
+    try {
+      Object.assign(s, parseCustomData(customInputValue));
+    } catch (e) {
+      if (statusEl) { statusEl.textContent = e.message; statusEl.classList.add('error-text'); }
+      log('err', `カスタムデータエラー: ${e.message}`);
+      return;
+    }
+    if (statusEl) {
+      statusEl.classList.remove('error-text');
+      statusEl.textContent = `パース成功: ${s.alert.service} — ${s.alert.title}`;
+    }
+  }
+  fireBtn.disabled = true;
   log('warn', `アラート発火: ${s.alert.service} — ${s.alert.title}`);
   await sleep(250);
   log('ok', `ログ収集中... ${s.logs.length}件`);
@@ -297,83 +493,207 @@ fireBtn.addEventListener('click', async () => {
   renderContext(s);
   contextGathered = true;
   fireBtn.disabled = false;
-  investigateBtn.disabled = !webllmEngine;
+  updateInvestigateEnabled();
   log('ok', 'コンテキスト収集完了 — 調査を開始できます');
+});
+
+// --- バックエンド選択（ブラウザ内WebLLM vs. 本物のClaude API） ---
+
+function updateInvestigateEnabled() {
+  investigateBtn.disabled = !contextGathered || (backend === 'claude' ? !claudeApiKey : !webllmEngine);
+}
+
+function setBackend(next) {
+  backend = next;
+  backendWebllmBtn.classList.toggle('active', backend === 'webllm');
+  backendClaudeBtn.classList.toggle('active', backend === 'claude');
+  webllmPanel.style.display = backend === 'webllm' ? '' : 'none';
+  claudePanel.style.display = backend === 'claude' ? '' : 'none';
+  updateInvestigateEnabled();
+}
+
+backendWebllmBtn.addEventListener('click', () => setBackend('webllm'));
+backendClaudeBtn.addEventListener('click', () => setBackend('claude'));
+
+claudeApiKeyInput.value = claudeApiKey;
+saveKeyBtn.addEventListener('click', () => {
+  const val = claudeApiKeyInput.value.trim();
+  claudeApiKey = val;
+  if (val) {
+    localStorage.setItem(CLAUDE_KEY_STORAGE, val);
+    aiStatus.textContent = 'Claude APIキーをこのブラウザに保存しました（api.anthropic.com以外には送信されません）。';
+    log('ok', 'Claude APIキーを保存しました');
+  } else {
+    localStorage.removeItem(CLAUDE_KEY_STORAGE);
+    aiStatus.textContent = 'Claude APIキーを削除しました。';
+    log('warn', 'Claude APIキーを削除しました');
+  }
+  updateInvestigateEnabled();
 });
 
 if (!navigator.gpu) {
   loadModelBtn.disabled = true;
   loadModelBtn.title = 'WebGPU対応ブラウザが必要です（例：デスクトップ版Chrome/Edge）。';
-  aiStatus.textContent = 'お使いのブラウザはWebGPUに対応していないため、ブラウザ内AIモデルを実行できません。';
+  aiStatus.textContent = 'お使いのブラウザはWebGPUに対応していないため、ブラウザ内AIモデルを実行できません。下のClaude APIタブに切り替えました。';
+  setBackend('claude');
+} else {
+  setBackend('webllm');
 }
 
-const PREFERRED_MODELS = ['Qwen2.5-1.5B-Instruct', 'Llama-3.2-3B-Instruct', 'Qwen2.5-0.5B-Instruct'];
-function pickModel(modelList) {
-  for (const name of PREFERRED_MODELS) {
-    const found = modelList.find(m => m.model_id.includes(name));
-    if (found) return found.model_id;
+// GPU性能が低い環境でも動くよう、最初から最も軽量なモデルを選択する。
+const PREFERRED_MODELS = ['Qwen2.5-0.5B-Instruct'];
+function pickModel(modelList, startTier = 0) {
+  for (let i = startTier; i < PREFERRED_MODELS.length; i++) {
+    const found = modelList.find(m => m.model_id.includes(PREFERRED_MODELS[i]));
+    if (found) return { modelId: found.model_id, tier: i };
   }
-  return modelList[0]?.model_id;
+  return { modelId: modelList[0]?.model_id, tier: PREFERRED_MODELS.length };
+}
+
+function isDeviceLostError(e) {
+  const msg = String((e && e.message) || e || '');
+  return /device was lost|gpudevicelostinfo|external instance reference/i.test(msg);
+}
+
+async function loadModel(tier) {
+  const webllm = webllmModule || (webllmModule = await import('https://esm.run/@mlc-ai/web-llm'));
+  const { modelId, tier: resolvedTier } = pickModel(webllm.prebuiltAppConfig.model_list, tier);
+  modelTierIndex = resolvedTier;
+  aiStatus.textContent = `${modelId} を読み込み中…`;
+  webllmEngine = await webllm.CreateMLCEngine(modelId, {
+    initProgressCallback: (report) => { aiStatus.textContent = report.text; },
+  });
+  aiStatus.textContent = `準備完了（${modelId}）。ブラウザ内でローカル実行中。`;
+  return modelId;
+}
+
+// GPUメモリ不足によるdevice-lostはより軽量なモデルで再試行し、それ以上軽量なものがなければ諦める
+async function loadModelWithFallback(startTier) {
+  let tier = startTier;
+  while (true) {
+    try {
+      return await loadModel(tier);
+    } catch (e) {
+      if (isDeviceLostError(e) && tier + 1 < PREFERRED_MODELS.length) {
+        log('err', `${PREFERRED_MODELS[tier]}の読み込み中にGPUデバイスがリセットされました（メモリ不足の可能性）。より軽量なモデルに切り替えます…`);
+        tier += 1;
+        continue;
+      }
+      throw e;
+    }
+  }
 }
 
 loadModelBtn.addEventListener('click', async () => {
   loadModelBtn.disabled = true;
   aiStatus.textContent = 'WebLLMを読み込み中…';
   try {
-    const webllm = await import('https://esm.run/@mlc-ai/web-llm');
-    const modelId = pickModel(webllm.prebuiltAppConfig.model_list);
-    aiStatus.textContent = `${modelId} を読み込み中…`;
-
-    webllmEngine = await webllm.CreateMLCEngine(modelId, {
-      initProgressCallback: (report) => { aiStatus.textContent = report.text; },
-    });
-
-    aiStatus.textContent = `準備完了（${modelId}）。ブラウザ内でローカル実行中。`;
-    investigateBtn.disabled = !contextGathered;
+    await loadModelWithFallback(0);
+    updateInvestigateEnabled();
   } catch (e) {
-    aiStatus.textContent = `AIモデルの読み込みに失敗しました: ${e.message}`;
+    aiStatus.textContent = isDeviceLostError(e)
+      ? 'GPUメモリ不足のためAIモデルを読み込めませんでした。他のタブ/アプリを閉じるか、ブラウザを再読み込みしてからもう一度お試しください。'
+      : `AIモデルの読み込みに失敗しました: ${e.message}`;
     loadModelBtn.disabled = false;
   }
 });
 
+async function runWebLLM(userMessage) {
+  const completion = await webllmEngine.chat.completions.create({
+    messages: [
+      { role: 'system', content: SYSTEM_PROMPT },
+      { role: 'user', content: userMessage },
+    ],
+    temperature: 0.1,
+    max_tokens: 900,
+    response_format: { type: 'json_object', schema: REPORT_JSON_SCHEMA },
+  });
+  return completion.choices[0].message.content;
+}
+
+// 本物のAnthropic Messages APIをユーザー自身のキーでブラウザから直接呼ぶ。
+// anthropic-dangerous-direct-browser-accessが必須——これがないとAnthropicの
+// CORSポリシーがブラウザからのリクエストを拒否する。キーはこのブラウザから
+// api.anthropic.comへ直接送信されるのみ。
+async function runClaudeApi(userMessage) {
+  const res = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      'x-api-key': claudeApiKey,
+      'anthropic-version': '2023-06-01',
+      'anthropic-dangerous-direct-browser-access': 'true',
+    },
+    body: JSON.stringify({
+      model: 'claude-haiku-4-5',
+      max_tokens: 1200,
+      system: SYSTEM_PROMPT,
+      messages: [{ role: 'user', content: userMessage }],
+      output_config: { format: { type: 'json_schema', schema: REPORT_JSON_SCHEMA_OBJ } },
+    }),
+  });
+  const data = await res.json();
+  if (!res.ok) {
+    throw new Error((data && data.error && data.error.message) || `HTTP ${res.status}`);
+  }
+  return (data.content || []).filter(b => b.type === 'text').map(b => b.text).join('');
+}
+
 investigateBtn.addEventListener('click', async () => {
-  if (!webllmEngine || !contextGathered) return;
+  if (!contextGathered) return;
+  if (backend === 'webllm' && !webllmEngine) return;
+  if (backend === 'claude' && !claudeApiKey) return;
   investigateBtn.disabled = true;
   reportBox.innerHTML = '';
   aiStatus.textContent = '調査中…';
   const s = activeScenario;
   const userMessage = buildUserMessage(s.alert, s.logs, s.deploys, s.metrics, s.sourceErrors);
   const started = performance.now();
-  log('ok', 'モデルに調査を依頼中（internal/agent/prompt.goと同一のシステムプロンプト）...');
+  log('ok', backend === 'claude'
+    ? 'Claude（claude-haiku-4-5）に調査を依頼中（internal/agent/prompt.goと同一のシステムプロンプト）...'
+    : 'モデルに調査を依頼中（internal/agent/prompt.goと同一のシステムプロンプト）...');
   try {
-    const completion = await webllmEngine.chat.completions.create({
-      messages: [
-        { role: 'system', content: SYSTEM_PROMPT },
-        { role: 'user', content: userMessage },
-      ],
-      temperature: 0.1,
-      max_tokens: 900,
-    });
-    const raw = completion.choices[0].message.content;
+    const raw = backend === 'claude' ? await runClaudeApi(userMessage) : await runWebLLM(userMessage);
     const elapsed = ((performance.now() - started) / 1000).toFixed(1);
     let report;
     try {
       report = parseModelResponse(raw);
     } catch (e) {
-      reportBox.innerHTML = `<div class="hint">モデルの応答をJSONとしてパースできませんでした（Claudeより小型のブラウザ内モデルではこの失敗が起きやすい）。生の出力:</div><pre class="raw">${escapeHtml(raw)}</pre>`;
+      reportBox.innerHTML = `<div class="hint">モデルの応答をJSONとしてパースできませんでした。生の出力:</div><pre class="raw">${escapeHtml(raw)}</pre>`;
       aiStatus.textContent = `パース失敗（${elapsed}秒）— 下の生出力を参照してください。`;
       log('err', `モデル応答のJSONパースに失敗`);
-      investigateBtn.disabled = false;
+      updateInvestigateEnabled();
       return;
     }
     renderReport(report);
     aiStatus.textContent = `${elapsed}秒でレポートを生成しました。`;
     log('ok', `調査完了（${elapsed}秒）`);
   } catch (e) {
-    aiStatus.textContent = `調査に失敗しました: ${e.message}`;
-    log('err', `調査に失敗: ${e.message}`);
+    if (backend === 'webllm' && isDeviceLostError(e)) {
+      if (modelTierIndex + 1 < PREFERRED_MODELS.length) {
+        log('err', 'GPUデバイスがリセットされました（メモリ不足の可能性）。より軽量なモデルに切り替えて再試行します…');
+        aiStatus.textContent = 'GPUメモリ不足のため、より軽量なモデルに切り替えています…';
+        try {
+          const modelId = await loadModelWithFallback(modelTierIndex + 1);
+          log('ok', `${modelId} の準備完了。もう一度「調査を開始」を押してください。`);
+        } catch (reloadErr) {
+          aiStatus.textContent = `軽量モデルへの切り替えにも失敗しました: ${reloadErr.message}`;
+          log('err', `再読み込み失敗: ${reloadErr.message}`);
+          webllmEngine = null;
+          loadModelBtn.disabled = false;
+        }
+      } else {
+        aiStatus.textContent = 'GPUメモリ不足で調査に失敗しました。他のタブ/アプリを閉じてブラウザを再読み込みしてから、もう一度お試しください。';
+        log('err', 'GPUデバイスロスト（これ以上軽量なモデルがありません）');
+        webllmEngine = null;
+        loadModelBtn.disabled = false;
+      }
+    } else {
+      aiStatus.textContent = `調査に失敗しました: ${e.message}`;
+      log('err', `調査に失敗: ${e.message}`);
+    }
   } finally {
-    investigateBtn.disabled = false;
+    updateInvestigateEnabled();
   }
 });
 
@@ -398,7 +718,7 @@ function renderReport(r) {
     <h3>根本原因の仮説</h3>
     ${hyps || '<div class="hint">（なし）</div>'}
     <h3>推奨アクション</h3>
-    <ul>${actions || '<li class="hint">（なし）</li>'}</ul>
+    <ul>${actions || '<li class="hint">モデルは具体的な次のアクションを提案しませんでした — 上記の仮説を出発点として手動で調査してください。</li>'}</ul>
     <h3>疑わしいデプロイ</h3>
     <ul>${deploys}</ul>
   `;
