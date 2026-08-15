@@ -39,6 +39,7 @@ func investigateHandler(inv *agent.Investigator, limiter *rateLimiter) http.Hand
 	return func(w http.ResponseWriter, r *http.Request) {
 		ip := clientIP(r)
 		if ok, reason := limiter.allow(ip); !ok {
+			log.Printf("free-tier investigate rate-limited for %s: %s", ip, reason)
 			writeJSONError(w, http.StatusTooManyRequests, reason)
 			return
 		}
@@ -46,9 +47,13 @@ func investigateHandler(inv *agent.Investigator, limiter *rateLimiter) http.Hand
 		r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodyBytes)
 		var req investigateRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			log.Printf("free-tier investigate rejected for %s: invalid request body: %v", ip, err)
 			writeJSONError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
 			return
 		}
+
+		start := time.Now()
+		log.Printf("free-tier investigate request from %s (service=%s)", ip, req.Alert.Service)
 
 		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 		defer cancel()
@@ -59,6 +64,8 @@ func investigateHandler(inv *agent.Investigator, limiter *rateLimiter) http.Hand
 			writeJSONError(w, http.StatusBadGateway, "investigation failed — try again, or use your own API key / the in-browser model")
 			return
 		}
+
+		log.Printf("free-tier investigate succeeded for %s in %s", ip, time.Since(start).Round(time.Millisecond))
 
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(report)
